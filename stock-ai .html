@@ -1,0 +1,218 @@
+import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+import plotly.graph_objects as go
+from streamlit_autorefresh import st_autorefresh
+
+# ======================
+# 初期設定
+# ======================
+st.set_page_config(page_title="機関追随デイトレAI", layout="wide")
+st.title("📈 機関追随デイトレAI（実戦版）")
+
+st_autorefresh(interval=60 * 1000, key="refresh")
+
+# ======================
+# 銘柄
+# ======================
+stocks = {
+    "三菱重工業": "7011.T",
+    "三井E&S": "7003.T",
+    "名村造船所": "7014.T",
+    "ispace": "9348.T"
+}
+
+selected = st.selectbox("銘柄選択", list(stocks.keys()))
+ticker = stocks[selected]
+
+# ======================
+# データ取得
+# ======================
+@st.cache_data(ttl=60)
+def load_data(ticker):
+    df = yf.download(ticker, period="1d", interval="1m")
+    df = df.replace([np.inf, -np.inf], np.nan).dropna()
+    return df
+
+df = load_data(ticker)
+
+close = df["Close"]
+high = df["High"]
+low = df["Low"]
+
+# ======================
+# 基本指標
+# ======================
+df["trend_5"] = close.pct_change(5)
+df["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+
+# ======================
+# 🔥 機関ロジック
+# ======================
+df["vwap"] = (close * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+df["vol_mean"] = df["Volume"].rolling(20).mean()
+df["big_money"] = df["Volume"] > df["vol_mean"] * 2
+
+df["absorption"] = (
+    (df["big_money"]) &
+    (abs(close - df["Open"]) / df["Open"] < 0.002)
+)
+
+df["high_break"] = close > df["High"].rolling(20).max().shift(1)
+
+df["fake_break"] = (
+    df["high_break"] &
+    (df["Volume"] < df["vol_mean"])
+)
+
+df = df.dropna()
+
+# ======================
+# シグナル
+# ======================
+df["signal"] = 0
+
+df.loc[
+    (df["big_money"]) &
+    (close > df["vwap"]) &
+    (df["trend_5"] > 0),
+    "signal"
+] = 1
+
+df.loc[
+    (df["absorption"].shift(1)) &
+    (df["high_break"]) &
+    (~df["fake_break"]),
+    "signal"
+] = 1
+
+df.loc[
+    (df["big_money"]) &
+    (close < df["vwap"]) &
+    (df["trend_5"] < 0),
+    "signal"
+] = -1
+
+# ======================
+# 📊 ATR（値幅予測）
+# ======================
+df["tr"] = np.maximum(
+    high - low,
+    np.maximum(
+        abs(high - close.shift()),
+        abs(low - close.shift())
+    )
+)
+
+df["atr"] = df["tr"].rolling(14).mean()
+
+# ======================
+# 💰 売買ロジック（損切り・利確・トレーリング）
+# ======================
+RISK = 0.5
+REWARD = 1.5
+TRAIL = 1.0
+
+position = 0
+entry_price = 0
+stop_loss = 0
+take_profit = 0
+
+positions = []
+
+for i in range(len(df)):
+    row = df.iloc[i]
+
+    if np.isnan(row["atr"]):
+        positions.append(0)
+        continue
+
+    # エントリー
+    if position == 0:
+        if row["signal"] == 1:
+            position = 1
+            entry_price = row["Close"]
+            stop_loss = entry_price - row["atr"] * RISK
+            take_profit = entry_price + row["atr"] * REWARD
+
+        elif row["signal"] == -1:
+            position = -1
+            entry_price = row["Close"]
+            stop_loss = entry_price + row["atr"] * RISK
+            take_profit = entry_price - row["atr"] * REWARD
+
+    # 保有（買い）
+    elif position == 1:
+        stop_loss = max(stop_loss, row["Close"] - row["atr"] * TRAIL)
+
+        if row["Low"] <= stop_loss or row["High"] >= take_profit:
+            position = 0
+
+    # 保有（売り）
+    elif position == -1:
+        stop_loss = min(stop_loss, row["Close"] + row["atr"] * TRAIL)
+
+        if row["High"] >= stop_loss or row["Low"] <= take_profit:
+            position = 0
+
+    positions.append(position)
+
+df["position"] = positions
+
+# ======================
+# 成績
+# ======================
+df["strategy_ret"] = df["position"].shift() * close.pct_change()
+df["equity"] = (1 + df["strategy_ret"]).cumprod()
+
+# ======================
+# 表示
+# ======================
+st.subheader("📊 パフォーマンス")
+
+st.write(f"最終リターン：{df['equity'].iloc[-1]-1:.2%}")
+st.write(f"最大値幅（ATR）：{df['atr'].iloc[-1]:.4f}")
+
+# ======================
+# チャート
+# ======================
+fig = go.Figure()
+
+fig.add_trace(go.Scatter(x=df.index, y=close, name="価格"))
+fig.add_trace(go.Scatter(x=df.index, y=df["vwap"], name="VWAP"))
+
+buy = df[df["signal"] == 1]
+sell = df[df["signal"] == -1]
+
+fig.add_trace(go.Scatter(
+    x=buy.index, y=buy["Close"],
+    mode="markers", name="BUY",
+    marker=dict(color="green", size=8)
+))
+
+fig.add_trace(go.Scatter(
+    x=sell.index, y=sell["Close"],
+    mode="markers", name="SELL",
+    marker=dict(color="red", size=8)
+))
+
+st.plotly_chart(fig, use_container_width=True)
+
+# ======================
+# 最新判断
+# ======================
+latest = df.iloc[-1]
+
+st.subheader("🧠 最新シグナル")
+
+if latest["signal"] == 1:
+    st.success("🟢 BUY（機関追随）")
+elif latest["signal"] == -1:
+    st.error("🔴 SELL（機関売り）")
+else:
+    st.info("⚪ 様子見")
+
+st.caption("※本ツールは投資助言ではありません。自己責任で判断してください。")
